@@ -10,7 +10,7 @@ import urllib.error
 from foods import FIELDS
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), "gemini-2.5-flash-lite"] if m]
+MODELS = [m for m in [os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"), "gemini-3.5-flash-lite"] if m]
 
 PROMPT = """Ты — опытный диетолог. Определи всю еду и напитки {where}.
 Для каждого продукта оцени вес порции в граммах (для напитков — мл) по размеру тарелки, приборов, упаковки,

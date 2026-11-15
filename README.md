@@ -1,1 +1,7 @@
-# kalooriy-bot
+# Дневник питания — Telegram-бот
+
+Записывай, что съел — кнопками, текстом («гречка 200, 2 яйца») или **фото тарелки** (ИИ Gemini сам распознает еду и порцию). Бот считает калории, белки, жиры, углеводы, клетчатку, витамины A/C/D/B12, кальций, железо, калий, магний и вечером присылает итог дня с советами.
+
+Запуск: `BOT_TOKEN=... GEMINI_API_KEY=... python bot.py` (без DATABASE_URL хранит данные в SQLite `data.db`).
+
+Хостинг: Render (free web service) + Render Postgres. Переменные: `BOT_TOKEN`, `DATABASE_URL`, `GEMINI_API_KEY`.

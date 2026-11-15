@@ -1,0 +1,27 @@
+databases:
+  - name: kaloriy-db
+    plan: free
+    region: frankfurt
+    postgresMajorVersion: "16"
+    databaseName: kaloriy_db
+    user: kaloriy_db_user
+
+services:
+  - type: web
+    name: kaloriy-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: kaloriy-db
+          property: connectionString
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

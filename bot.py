@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from foods import FOODS, FIELDS, NORMS, MICRO_NAMES, MICRO_TIPS, CATEGORIES, by_category
 from db import DB
+import ai
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
@@ -24,6 +25,7 @@ API = f"https://api.telegram.org/bot{TOKEN}/"
 
 db = None
 STATE = {}  # user_id -> {"await": ..., ...}  ожидание ввода текста
+AI_PENDING = {}  # user_id -> {"items": [...], "comment": str}  результат ИИ до подтверждения
 
 BTN_ADD = "➕ Добавить еду"
 BTN_TODAY = "📊 Сегодня"
@@ -299,7 +301,9 @@ HELP = (
     "1️⃣ Кнопка «➕ Добавить еду» → категория → продукт → граммы.\n"
     "2️⃣ Или просто напиши текстом:\n"
     "   <i>гречка 200</i>\n   <i>2 яйца</i>\n   <i>банан</i> (возьмёт 1 шт)\n"
-    "   <i>курица 150, рис 200, огурец</i> — можно сразу несколько через запятую или с новой строки.\n\n"
+    "   <i>курица 150, рис 200, огурец</i> — можно сразу несколько через запятую или с новой строки.\n"
+    "3️⃣ 📷 Или просто <b>пришли фото еды</b> — ИИ сам поймёт, что на тарелке, прикинет порцию и посчитает калории. "
+    "Можно добавить подпись, например «бутерброд с сыром и кофе с сахаром».\n\n"
     "<b>Кнопки:</b>\n"
     "📊 Сегодня — что съел и сколько осталось\n"
     "📋 Итог дня — полный отчёт: калории, БЖУ, витамины, минералы и советы\n"
@@ -448,6 +452,10 @@ def handle_free_text(user_id, chat_id, text):
         rows = [[(f["name"], f"pick:{f['id']}")] for f in found[:8]]
         send(chat_id, f"🤔 «{part}» — уточни, что именно{grams_hint}:", ikb(rows))
 
+    if unknown and ai.enabled():
+        desc = ", ".join(unknown)
+        run_ai(user_id, chat_id, lambda: ai.analyze_text(desc), f"🤖 «{desc}» нет в базе — считаю с помощью ИИ…")
+        return
     for part in unknown:
         rows = [[("⭐ Добавить свой продукт", "newcustom")], [("📂 Выбрать из списка", "cats")]]
         send(chat_id, f"❓ Не нашёл «{part}» в базе.\nМожешь выбрать похожее из категорий или добавить свой продукт с КБЖУ.", ikb(rows))
@@ -478,6 +486,10 @@ def on_message(msg):
     user_id = msg["from"]["id"]
     text = (msg.get("text") or "").strip()
     db.ensure_user(user_id, chat_id)
+    if msg.get("photo"):
+        STATE.pop(user_id, None)
+        handle_photo(msg)
+        return
     if not text:
         send(chat_id, "Пришли текстом, что съел — например: <i>гречка 200</i>", MAIN_KB)
         return
@@ -614,7 +626,9 @@ def on_callback(cq):
     db.ensure_user(user_id, chat_id)
     answer = ""
 
-    if data == "cats":
+    if data.startswith("ai_"):
+        answer = ai_callback(user_id, chat_id, msg_id, data)
+    elif data == "cats":
         edit(chat_id, msg_id, "Выбери категорию 👇", kb_categories())
     elif data.startswith("cat:"):
         _, cat, page = data.split(":")
@@ -702,6 +716,108 @@ def on_callback(cq):
         send(chat_id, "🔍 Напиши название продукта:")
 
     api("answerCallbackQuery", callback_query_id=cq["id"], text=answer)
+
+
+# ======================= ИИ: фото и описание =======================
+def download_photo(photos):
+    best = sorted(photos, key=lambda p: p.get("file_size", 0) or p.get("width", 0))[-1]
+    r = api("getFile", file_id=best["file_id"])
+    path = r.get("result", {}).get("file_path")
+    if not path:
+        raise ai.AIError("no file")
+    with urllib.request.urlopen(f"https://api.telegram.org/file/bot{TOKEN}/{path}", timeout=60) as resp:
+        return resp.read()
+
+
+def ai_card(user_id):
+    pend = AI_PENDING.get(user_id)
+    if not pend or not pend["items"]:
+        return "Список пуст — ничего не записываю.", None
+    tot = {f: sum(i[f] for i in pend["items"]) for f in FIELDS}
+    L = ["🤖 <b>Вот что я вижу:</b>\n"]
+    for i in pend["items"]:
+        L.append(f"• {i['name']} ~{fmt(i['grams'])} г — <b>{fmt(i['kcal'])}</b> ккал "
+                 f"(Б {fmt(i['p'])} · Ж {fmt(i['f'])} · У {fmt(i['c'])})")
+    L.append(f"\n🔥 Всего: <b>{fmt(tot['kcal'])}</b> ккал · Б {fmt(tot['p'])} · Ж {fmt(tot['f'])} · У {fmt(tot['c'])}")
+    if pend.get("comment"):
+        L.append(f"\n💬 {pend['comment']}")
+    L.append("\n<i>Это оценка на глаз (±20–30%). Поправь порцию, если ешь больше или меньше.</i>")
+    rows = [[("✅ Записать", "ai_ok"), ("🚫 Отмена", "ai_no")],
+            [("➖ Порция меньше", "ai_x:0.75"), ("➕ Порция больше", "ai_x:1.25")]]
+    for n, i in enumerate(pend["items"][:8]):
+        rows.append([(f"❌ Убрать: {i['name'][:25]}", f"ai_rm:{n}")])
+    return "\n".join(L), ikb(rows)
+
+
+def run_ai(user_id, chat_id, job, wait_text):
+    """Запускает ИИ в отдельном потоке, чтобы бот не подвисал."""
+    r = send(chat_id, wait_text)
+    wait_id = (r.get("result") or {}).get("message_id")
+
+    def worker():
+        try:
+            items, comment = job()
+            if not items:
+                text = "🤷 " + (comment or "Не смог распознать еду. Попробуй фото поближе или напиши текстом.")
+                edit(chat_id, wait_id, text) if wait_id else send(chat_id, text)
+                return
+            AI_PENDING[user_id] = {"items": items, "comment": comment}
+            text, kb = ai_card(user_id)
+            edit(chat_id, wait_id, text, kb) if wait_id else send(chat_id, text, kb)
+        except ai.AIError as e:
+            text = ("⏳ Лимит бесплатного ИИ на сейчас исчерпан — попробуй через минуту или запиши текстом."
+                    if str(e) == "limit" else "😕 ИИ сейчас не ответил. Попробуй ещё раз или запиши текстом.")
+            edit(chat_id, wait_id, text) if wait_id else send(chat_id, text)
+        except Exception:
+            traceback.print_exc()
+            send(chat_id, "😕 Что-то пошло не так с распознаванием. Попробуй ещё раз.")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def handle_photo(msg):
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
+    if not ai.enabled():
+        send(chat_id, "📷 Распознавание по фото пока не подключено. Запиши текстом, например: <i>бутерброд с сыром, кофе</i>")
+        return
+    caption = (msg.get("caption") or "").strip()
+    photos = msg["photo"]
+    run_ai(user_id, chat_id, lambda: ai.analyze_photo(download_photo(photos), caption),
+           "📷 Смотрю на фото и считаю калории… (5–15 сек)")
+
+
+def ai_callback(user_id, chat_id, msg_id, data):
+    pend = AI_PENDING.get(user_id)
+    if not pend:
+        edit(chat_id, msg_id, "Этот результат уже неактуален. Пришли фото ещё раз.")
+        return ""
+    if data == "ai_no":
+        AI_PENDING.pop(user_id, None)
+        edit(chat_id, msg_id, "🚫 Отменено, ничего не записал.")
+        return ""
+    if data == "ai_ok":
+        for i in pend["items"]:
+            db.add_entry(user_id, today(), "🤖 " + i["name"], i["grams"], i)
+        AI_PENDING.pop(user_id, None)
+        u = db.get_user(user_id)
+        t = sum_entries(db.day_entries(user_id, today()))
+        edit(chat_id, msg_id, f"✅ Записал {len(pend['items'])} поз.\n\nЗа сегодня: <b>{fmt(t['kcal'])}</b> / "
+                              f"{fmt(u['kcal_goal'])} ккал\n{bar(t['kcal'], u['kcal_goal'])}", kb_after_add())
+        return "Записано ✅"
+    if data.startswith("ai_x:"):
+        k = float(data[5:])
+        for i in pend["items"]:
+            i["grams"] *= k
+            for f in FIELDS:
+                i[f] *= k
+    elif data.startswith("ai_rm:"):
+        n = int(data[6:])
+        if 0 <= n < len(pend["items"]):
+            pend["items"].pop(n)
+    text, kb = ai_card(user_id)
+    edit(chat_id, msg_id, text, kb)
+    return ""
 
 
 # ======================= Фоновые задачи =======================

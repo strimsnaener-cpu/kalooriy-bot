@@ -30,6 +30,10 @@ SCHEMA = [
         kcal_goal REAL DEFAULT 2200,
         report_hour INTEGER DEFAULT 22,
         last_report TEXT DEFAULT '')""",
+    """CREATE TABLE IF NOT EXISTS jarvis_links (
+        user_id BIGINT PRIMARY KEY,
+        key_hash TEXT NOT NULL,
+        created_at BIGINT NOT NULL)""",
     f"""CREATE TABLE IF NOT EXISTS custom_foods (
         id {{serial}},
         user_id BIGINT NOT NULL,
@@ -110,6 +114,17 @@ class DB:
         for k, v in kw.items():
             assert k in ("kcal_goal", "report_hour", "last_report")
             self.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, user_id))
+
+    # ---------- связь с JARVIS (в базе только хэш кода) ----------
+    def set_jarvis_key(self, user_id, key_hash):
+        self.execute("DELETE FROM jarvis_links WHERE user_id=?", (user_id,))
+        if key_hash:
+            self.execute("INSERT INTO jarvis_links (user_id, key_hash, created_at) VALUES (?, ?, ?)",
+                         (user_id, key_hash, int(time.time())))
+
+    def user_by_jarvis_key(self, key_hash):
+        rows = self.execute("SELECT user_id FROM jarvis_links WHERE key_hash=?", (key_hash,), fetch=True)
+        return rows[0][0] if rows else None
 
     # ---------- entries ----------
     def add_entry(self, user_id, day, name, grams, nutr):

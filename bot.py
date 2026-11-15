@@ -3,16 +3,19 @@
 Без сторонних библиотек для Telegram — только стандартный Python (+psycopg2 для Postgres).
 """
 import difflib
+import hashlib
+import html
 import json
 import os
 import re
+import secrets
 import threading
 import time
 import traceback
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
 from foods import FOODS, FIELDS, NORMS, MICRO_NAMES, MICRO_TIPS, CATEGORIES, by_category
@@ -311,6 +314,8 @@ HELP = (
     "📈 Неделя — калории по дням за 7 дней\n"
     "🎯 Цели — норма калорий и время вечернего отчёта\n"
     "⭐ Мои продукты — добавить свой продукт со своим КБЖУ\n\n"
+    "🎙 <b>Голосовой помощник JARVIS:</b> команда /jarvis даст код для связи. Тогда можно сказать на ПК "
+    "«Джарвис, запиши: гречка 200» или «сколько я сегодня съел?».\n\n"
     "Каждый вечер в выбранное время бот сам пришлёт итог дня 🌙"
 )
 
@@ -414,7 +419,9 @@ def add_food(user_id, chat_id, food, grams, msg_id=None):
         send(chat_id, text, kb_after_add())
 
 
-def handle_free_text(user_id, chat_id, text):
+def parse_and_add(user_id, text, pick_best=False):
+    """Разбирает «гречка 200, 2 яйца» и сразу записывает то, что точно узнал.
+    pick_best=True (запрос от JARVIS) — при сомнении берёт самый похожий продукт, а не спрашивает."""
     parts = [p for p in re.split(r"[,\n;]+|\s+и\s+", text) if p.strip()]
     added, unknown, ambiguous = [], [], []
     for part in parts:
@@ -426,7 +433,7 @@ def handle_free_text(user_id, chat_id, text):
         found = [f for _, f in scored]
         best = scored[0][0]
         second = scored[1][0] if len(scored) > 1 else 0
-        if best >= 85 and best > second or len(scored) == 1 and best >= 60:
+        if best >= 85 and best > second or len(scored) == 1 and best >= 60 or pick_best and best >= 60:
             food = found[0]
             grams = to_grams(food, amount, unit)
             nutr = calc(food["per100"], grams)
@@ -434,7 +441,11 @@ def handle_free_text(user_id, chat_id, text):
             added.append((food, grams, nutr))
         else:
             ambiguous.append((part.strip(), found, amount, unit))
+    return added, ambiguous, unknown
 
+
+def handle_free_text(user_id, chat_id, text):
+    added, ambiguous, unknown = parse_and_add(user_id, text)
     if added:
         u = db.get_user(user_id)
         t = sum_entries(db.day_entries(user_id, today()))
@@ -499,6 +510,15 @@ def on_message(msg):
         STATE.pop(user_id, None)
         name = msg["from"].get("first_name", "")
         send(chat_id, f"Привет, {name}! 👋\n\n" + HELP, MAIN_KB)
+        return
+    if text.startswith("/jarvis_off"):
+        db.set_jarvis_key(user_id, None)
+        send(chat_id, "🔌 JARVIS отключён: старый код больше не работает. Новый код — команда /jarvis.", MAIN_KB)
+        return
+    if text.startswith("/jarvis"):
+        key = "nb_" + secrets.token_urlsafe(24)
+        db.set_jarvis_key(user_id, key_hash(key))
+        send(chat_id, JARVIS_TEXT.format(key=key), MAIN_KB)
         return
     if text.startswith("/help") or text == BTN_HELP:
         STATE.pop(user_id, None)
@@ -854,14 +874,143 @@ def keep_alive():
             print("keep-alive error:", e, flush=True)
 
 
+# ======================= Связь с JARVIS =======================
+JARVIS_TEXT = (
+    "🎙 <b>Связь с JARVIS</b>\n\n"
+    "JARVIS — голосовой помощник на твоём ПК. После связи он умеет:\n"
+    "• записывать еду голосом: «Джарвис, запиши: гречка 200 и 2 яйца»\n"
+    "• отвечать, сколько ты съел сегодня и сколько осталось\n"
+    "• зачитывать итог дня и статистику за неделю\n\n"
+    "Твой секретный код (нажми, чтобы скопировать):\n<code>{key}</code>\n\n"
+    "Вставь его в JARVIS → ⚙️ Настройки → вкладка «Питание».\n"
+    "⚠️ Никому не показывай этот код. Новый код отменяет старый; отключить связь — /jarvis_off"
+)
+
+
+def key_hash(key):
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def plain(text):
+    """HTML-текст бота → обычный текст для JARVIS."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def today_json(user_id):
+    u = db.get_user(user_id)
+    g = goals_for(u["kcal_goal"])
+    entries = db.day_entries(user_id, today())
+    t = sum_entries(entries) if entries else {"kcal": 0, "p": 0, "f": 0, "c": 0}
+    return {"date": today(), "kcal": round(t["kcal"]), "goal_kcal": round(g["kcal"]),
+            "left_kcal": round(g["kcal"] - t["kcal"]),
+            "protein": round(t["p"]), "fat": round(t["f"]), "carbs": round(t["c"]),
+            "goal_protein": round(g["p"]), "goal_fat": round(g["f"]), "goal_carbs": round(g["c"]),
+            "items": [{"name": e["name"], "grams": round(e["grams"]), "kcal": round(e["kcal"])} for e in entries]}
+
+
+def jarvis_add(user_id, text):
+    """Запись еды по голосовой команде из JARVIS: без вопросов; непонятное считает ИИ."""
+    added, ambiguous, unknown = parse_and_add(user_id, text, pick_best=True)
+    lines = [f"{f['name']} {fmt(g)} г — {fmt(n['kcal'])} ккал" for f, g, n in added]
+    unknown = unknown + [part for part, *_ in ambiguous]
+    unclear = []
+    if unknown and ai.enabled():
+        try:
+            items, _ = ai.analyze_text(", ".join(unknown))
+            for i in items:
+                db.add_entry(user_id, today(), "🤖 " + i["name"], i["grams"], i)
+                lines.append(f"{i['name']} ~{fmt(i['grams'])} г — {fmt(i['kcal'])} ккал (оценка ИИ)")
+            if not items:
+                unclear = unknown
+        except Exception:
+            traceback.print_exc()
+            unclear = unknown
+    else:
+        unclear = unknown
+    u = db.get_user(user_id)
+    if lines:
+        t = sum_entries(db.day_entries(user_id, today()))
+        send(u["chat_id"], "🎙 <b>Записал через JARVIS:</b>\n" + "\n".join("• " + x for x in lines) +
+             f"\n\nЗа сегодня: <b>{fmt(t['kcal'])}</b> / {fmt(u['kcal_goal'])} ккал\n{bar(t['kcal'], u['kcal_goal'])}",
+             kb_after_add())
+    return {"added": lines, "unclear": unclear, "today": today_json(user_id)}
+
+
+def jarvis_undo(user_id):
+    e = db.last_entry(user_id, today())
+    if not e:
+        return {"removed": None, "today": today_json(user_id)}
+    entry_id, name = e[0], e[1]
+    db.delete_entry(user_id, entry_id)
+    send(db.get_user(user_id)["chat_id"], f"↩️ JARVIS удалил последнюю запись: {name}", MAIN_KB)
+    return {"removed": name, "today": today_json(user_id)}
+
+
 class Health(BaseHTTPRequestHandler):
+    def _json(self, code, data):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _jarvis_user(self):
+        key = (self.headers.get("X-Jarvis-Key") or "").strip()
+        if not key.startswith("nb_") or len(key) > 100:
+            return None
+        return db.user_by_jarvis_key(key_hash(key))
+
+    def _api(self, method):
+        path = self.path.split("?")[0].rstrip("/")
+        user_id = self._jarvis_user()
+        if user_id is None or db.get_user(user_id) is None:
+            time.sleep(1)  # замедляем подбор кода
+            return self._json(401, {"error": "Неверный код JARVIS. Получи новый командой /jarvis в боте."})
+        body = {}
+        if method == "POST":
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 4000:
+                return self._json(413, {"error": "Слишком длинный запрос"})
+            try:
+                body = json.loads(self.rfile.read(n) or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "Плохой JSON"})
+        try:
+            if method == "GET" and path == "/api/jarvis/today":
+                return self._json(200, {"today": today_json(user_id), "text": plain(today_text(user_id))})
+            if method == "GET" and path == "/api/jarvis/report":
+                return self._json(200, {"text": plain(report_text(user_id))})
+            if method == "GET" and path == "/api/jarvis/week":
+                return self._json(200, {"text": plain(week_text(user_id))})
+            if method == "POST" and path == "/api/jarvis/add":
+                text = str(body.get("text", "")).strip()[:500]
+                if not text:
+                    return self._json(400, {"error": "Пустой список еды"})
+                return self._json(200, jarvis_add(user_id, text))
+            if method == "POST" and path == "/api/jarvis/undo":
+                return self._json(200, jarvis_undo(user_id))
+        except Exception:
+            traceback.print_exc()
+            return self._json(500, {"error": "Ошибка в боте"})
+        return self._json(404, {"error": "Нет такой команды"})
+
     def do_GET(self):
+        if self.path.startswith("/api/"):
+            return self._api("GET")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write("Бот дневника питания работает ✅".encode("utf-8"))
 
-    do_HEAD = do_GET
+    def do_POST(self):
+        if self.path.startswith("/api/"):
+            return self._api("POST")
+        self._json(404, {"error": "not found"})
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, *a):
         pass
@@ -869,7 +1018,7 @@ class Health(BaseHTTPRequestHandler):
 
 def run_http():
     port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), Health).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", port), Health).serve_forever()
 
 
 def polling():
@@ -882,6 +1031,7 @@ def polling():
         {"command": "week", "description": "Статистика за неделю"},
         {"command": "goals", "description": "Цели и время отчёта"},
         {"command": "undo", "description": "Отменить последнюю запись"},
+        {"command": "jarvis", "description": "Связать с голосовым помощником JARVIS"},
     ])
     offset = 0
     print("Bot started", flush=True)

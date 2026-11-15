@@ -33,7 +33,7 @@ def enabled():
     return bool(GEMINI_KEY)
 
 
-def _call(parts):
+def _call(parts, parser=None):
     last_err = None
     for model in MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -45,7 +45,7 @@ def _call(parts):
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.loads(r.read().decode("utf-8"))
             text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return _parse(text)
+            return (parser or _parse)(text)
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", "ignore")[:300]
             print("Gemini error", model, e.code, msg, flush=True)
@@ -93,3 +93,49 @@ def analyze_text(description):
     parts = [{"text": PROMPT.format(where=f"в описании: «{description}»",
                                     hint="Если вес не указан — возьми обычную порцию.")}]
     return _call(parts)
+
+
+RECIPE_PROMPT = """Ты — повар и нутрициолог. На фото продукты (холодильник, стол, пакеты из магазина).
+{hint}
+1) Перечисли, какие продукты видишь.
+2) Предложи 3 простых, сытных и полезных блюда из этих продуктов (можно добавить соль, специи, воду, немного масла).
+   Блюда должны подходить подростку, который хочет питаться здоровее: побольше белка и овощей,
+   поменьше сахара и жареного. Без экстремальных диет.
+3) Для каждого блюда: ингредиенты с граммами на ОДНУ порцию, 3–6 коротких шагов приготовления,
+   и пищевая ценность ОДНОЙ порции.
+Верни ТОЛЬКО JSON:
+{{"products": ["..."],
+ "recipes": [{{"title": "название", "time_min": 0,
+   "ingredients": [{{"name": "...", "grams": 0}}],
+   "steps": ["..."],
+   "grams": 0, "kcal": 0, "p": 0, "f": 0, "c": 0, "fib": 0,
+   "A": 0, "C": 0, "D": 0, "B12": 0, "Ca": 0, "Fe": 0, "K": 0, "Mg": 0}}]}}
+Единицы: p,f,c,fib — г; A,D,B12 — мкг; C,Ca,Fe,K,Mg — мг. Всё по-русски."""
+
+
+def _parse_recipes(text):
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise AIError("bad json")
+    data = json.loads(m.group(0))
+    recipes = []
+    for r in data.get("recipes", [])[:3]:
+        title = str(r.get("title", "")).strip()[:60]
+        if not title:
+            continue
+        rec = {"title": title, "time_min": int(_num(r.get("time_min"))),
+               "ingredients": [(str(i.get("name", ""))[:40], _num(i.get("grams"))) for i in r.get("ingredients", [])[:12]],
+               "steps": [str(s)[:200] for s in r.get("steps", [])[:8]],
+               "grams": _num(r.get("grams"))}
+        for f in FIELDS:
+            rec[f] = _num(r.get(f))
+        recipes.append(rec)
+    products = [str(p)[:30] for p in data.get("products", [])[:20]]
+    return products, recipes
+
+
+def recipes_from_photo(image_bytes, caption=""):
+    hint = f"Пользователь подписал: «{caption}»." if caption else ""
+    parts = [{"text": RECIPE_PROMPT.format(hint=hint)},
+             {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}}]
+    return _call(parts, parser=_parse_recipes)

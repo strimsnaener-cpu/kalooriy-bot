@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from foods import FOODS, FIELDS, NORMS, MICRO_NAMES, MICRO_TIPS, CATEGORIES, by_category
 from db import DB
 import ai
+import workouts as W
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Kyiv"))
@@ -28,6 +29,8 @@ API = f"https://api.telegram.org/bot{TOKEN}/"
 
 db = None
 STATE = {}  # user_id -> {"await": ..., ...}  ожидание ввода текста
+LAST_PHOTO = {}  # user_id -> (photos, caption)
+RECIPES = {}  # user_id -> [recipe, ...]
 AI_PENDING = {}  # user_id -> {"items": [...], "comment": str}  результат ИИ до подтверждения
 
 BTN_ADD = "➕ Добавить еду"
@@ -38,9 +41,11 @@ BTN_WEEK = "📈 Неделя"
 BTN_GOALS = "🎯 Цели"
 BTN_MY = "⭐ Мои продукты"
 BTN_HELP = "❓ Помощь"
+BTN_WORKOUT = "🏋️ Тренировка"
+BTN_COOK = "🧑‍🍳 Что приготовить"
 
 MAIN_KB = {
-    "keyboard": [[BTN_ADD, BTN_TODAY], [BTN_REPORT, BTN_UNDO], [BTN_WEEK, BTN_GOALS], [BTN_MY, BTN_HELP]],
+    "keyboard": [[BTN_ADD, BTN_TODAY], [BTN_REPORT, BTN_UNDO], [BTN_WORKOUT, BTN_COOK], [BTN_WEEK, BTN_GOALS], [BTN_MY, BTN_HELP]],
     "resize_keyboard": True,
     "is_persistent": True,
 }
@@ -313,7 +318,9 @@ HELP = (
     "↩️ Отменить последнее — удалить последнюю запись\n"
     "📈 Неделя — калории по дням за 7 дней\n"
     "🎯 Цели — норма калорий и время вечернего отчёта\n"
-    "⭐ Мои продукты — добавить свой продукт со своим КБЖУ\n\n"
+    "⭐ Мои продукты — добавить свой продукт со своим КБЖУ\n"
+    "🏋️ Тренировка — план на сегодня (гантели + турник), отметка «сделал», утреннее напоминание\n"
+    "🧑‍🍳 Что приготовить — сфоткай продукты, получишь 3 рецепта с КБЖУ\n\n"
     "🎙 <b>Голосовой помощник JARVIS:</b> команда /jarvis даст код для связи. Тогда можно сказать на ПК "
     "«Джарвис, запиши: гречка 200» или «сколько я сегодня съел?».\n\n"
     "Каждый вечер в выбранное время бот сам пришлёт итог дня 🌙"
@@ -385,9 +392,9 @@ def kb_after_add():
 
 def kb_goals(u):
     return ikb([
-        [(f"{k}{' ✅' if int(u['kcal_goal']) == k else ''}", f"goal:{k}") for k in (1600, 1800, 2000)],
-        [(f"{k}{' ✅' if int(u['kcal_goal']) == k else ''}", f"goal:{k}") for k in (2200, 2500, 2800)],
-        [(f"{k}{' ✅' if int(u['kcal_goal']) == k else ''}", f"goal:{k}") for k in (3000, 3300)] + [("✏️ Своя", "goal:custom")],
+        [(f"{k}{' ✅' if int(u['kcal_goal']) == k else ''}", f"goal:{k}") for k in (2000, 2200, 2400)],
+        [(f"{k}{' ✅' if int(u['kcal_goal']) == k else ''}", f"goal:{k}") for k in (2600, 2800, 3000)],
+        [("✏️ Своя (от врача)", "goal:custom")],
         [(f"🌙 {h}:00{' ✅' if u['report_hour'] == h else ''}", f"hour:{h}") for h in (20, 21, 22, 23)],
         [(f"🔕 Не присылать{' ✅' if u['report_hour'] == -1 else ''}", "hour:-1")],
     ])
@@ -400,7 +407,9 @@ def goals_text(u):
             f"🔥 Калории: <b>{fmt(g['kcal'])}</b> ккал\n"
             f"🥩 Белки: {fmt(g['p'])} г · 🧈 Жиры: {fmt(g['f'])} г · 🍞 Углеводы: {fmt(g['c'])} г\n"
             f"🌙 Вечерний отчёт: <b>{hour}</b>\n\n"
-            f"Ориентир: похудение ≈ 1800–2000, поддержание ≈ 2200–2500, набор массы ≈ 2800+ (для парня среднего роста и веса).\n\n"
+            f"ℹ️ Подросткам нельзя резко урезать еду — организм ещё растёт. Лучшую норму подскажет педиатр "
+            f"или эндокринолог: впиши её через «Своя». Главное — не голодать, есть больше белка и овощей, "
+            f"меньше сладкого и газировки, и больше двигаться.\n\n"
             f"Выбери норму калорий и время отчёта:")
 
 
@@ -498,8 +507,14 @@ def on_message(msg):
     text = (msg.get("text") or "").strip()
     db.ensure_user(user_id, chat_id)
     if msg.get("photo"):
+        cook = STATE.get(user_id, {}).get("await") == "cook_photo" or \
+            re.search(r"приготов|рецепт|что сделать|что можно", (msg.get("caption") or "").lower())
         STATE.pop(user_id, None)
-        handle_photo(msg)
+        LAST_PHOTO[user_id] = (msg["photo"], (msg.get("caption") or "").strip())
+        if cook:
+            handle_cook_photo(user_id, chat_id)
+        else:
+            handle_photo(msg)
         return
     if not text:
         send(chat_id, "Пришли текстом, что съел — например: <i>гречка 200</i>", MAIN_KB)
@@ -525,7 +540,7 @@ def on_message(msg):
         send(chat_id, HELP, MAIN_KB)
         return
 
-    menu = {BTN_ADD, BTN_TODAY, BTN_REPORT, BTN_UNDO, BTN_WEEK, BTN_GOALS, BTN_MY}
+    menu = {BTN_ADD, BTN_TODAY, BTN_REPORT, BTN_UNDO, BTN_WEEK, BTN_GOALS, BTN_MY, BTN_WORKOUT, BTN_COOK}
     if text in menu or text.startswith("/"):
         STATE.pop(user_id, None)
 
@@ -544,6 +559,13 @@ def on_message(msg):
         send(chat_id, goals_text(u), kb_goals(u))
     elif text == BTN_MY:
         my_products(user_id, chat_id)
+    elif text == BTN_WORKOUT or text == "/workout":
+        text_, kb = workout_screen(user_id)
+        send(chat_id, text_, kb)
+    elif text == BTN_COOK or text == "/cook":
+        STATE[user_id] = {"await": "cook_photo"}
+        send(chat_id, "🧑‍🍳 Сфоткай продукты, которые у тебя есть (холодильник, стол, пакет из магазина) — "
+                      "я предложу 3 блюда с рецептом и посчитаю калории, белки, жиры и углеводы на порцию.")
     elif st.get("await") == "amount":
         m = re.match(r"^\s*(\d+(?:[.,]\d+)?)", text)
         food = get_food(user_id, st["fid"])
@@ -567,8 +589,8 @@ def on_message(msg):
         send(chat_id, f"⭐ Продукт «{name}» сохранён! Теперь его можно писать текстом или найти в «⭐ Мои продукты».", MAIN_KB)
     elif st.get("await") == "goal":
         m = re.match(r"^\s*(\d{3,5})", text)
-        if not m or not 800 <= int(m.group(1)) <= 6000:
-            send(chat_id, "Напиши число калорий от 800 до 6000, например <b>2300</b>")
+        if not m or not 1800 <= int(m.group(1)) <= 4500:
+            send(chat_id, "Напиши число калорий от 1800 до 4500, например <b>2400</b>. Меньше 1800 в твоём возрасте — опасно мало.")
             return
         STATE.pop(user_id, None)
         db.set_user(user_id, kcal_goal=int(m.group(1)))
@@ -615,6 +637,7 @@ def week_text(user_id):
             L.append(f"{label}: <b>{fmt(kcal)}</b> ккал · Б {fmt(p)} г  {bar(kcal, u['kcal_goal'], 6)}")
         else:
             L.append(f"{label}: —")
+    L.append(f"\n🏋️ Тренировок за 7 дней: <b>{db.workouts_count(user_id, days[0])}</b>")
     if filled:
         avg = sum(k for k, _ in filled) / len(filled)
         avg_p = sum(p for _, p in filled) / len(filled)
@@ -648,6 +671,39 @@ def on_callback(cq):
 
     if data.startswith("ai_"):
         answer = ai_callback(user_id, chat_id, msg_id, data)
+    elif data == "cook_last":
+        AI_PENDING.pop(user_id, None)
+        edit(chat_id, msg_id, "Ок, это не еда на тарелке, а продукты 👍")
+        handle_cook_photo(user_id, chat_id)
+    elif data.startswith("rcp:"):
+        recs = RECIPES.get(user_id) or []
+        n = int(data[4:])
+        if 0 <= n < len(recs):
+            r = recs[n]
+            db.add_entry(user_id, today(), "🍳 " + r["title"], r["grams"] or 300, r)
+            u = db.get_user(user_id)
+            t = sum_entries(db.day_entries(user_id, today()))
+            send(chat_id, f"✅ Записал: {r['title']} — {fmt(r['kcal'])} ккал\n\nЗа сегодня: <b>{fmt(t['kcal'])}</b> / "
+                          f"{fmt(u['kcal_goal'])} ккал\n{bar(t['kcal'], u['kcal_goal'])}", kb_after_add())
+            answer = "Записано ✅"
+        else:
+            answer = "Рецепт устарел, пришли фото ещё раз"
+    elif data == "wk_done":
+        db.mark_workout(user_id, today())
+        answer = "Красавчик! 💪"
+        t, kb = workout_screen(user_id)
+        edit(chat_id, msg_id, t, kb)
+    elif data == "wk_week":
+        u = db.get_user(user_id)
+        send(chat_id, W.week_plan_text(training_week(u)))
+    elif data == "wk_today":
+        t, kb = workout_screen(user_id)
+        edit(chat_id, msg_id, t, kb)
+    elif data.startswith("wkh:"):
+        db.set_user(user_id, workout_hour=int(data[4:]))
+        answer = "Сохранено"
+        t, kb = workout_screen(user_id)
+        edit(chat_id, msg_id, t, kb)
     elif data == "cats":
         edit(chat_id, msg_id, "Выбери категорию 👇", kb_categories())
     elif data.startswith("cat:"):
@@ -766,6 +822,8 @@ def ai_card(user_id):
             [("➖ Порция меньше", "ai_x:0.75"), ("➕ Порция больше", "ai_x:1.25")]]
     for n, i in enumerate(pend["items"][:8]):
         rows.append([(f"❌ Убрать: {i['name'][:25]}", f"ai_rm:{n}")])
+    if LAST_PHOTO.get(user_id):
+        rows.append([("🧑‍🍳 Это продукты — что приготовить?", "cook_last")])
     return "\n".join(L), ikb(rows)
 
 
@@ -840,6 +898,88 @@ def ai_callback(user_id, chat_id, msg_id, data):
     return ""
 
 
+# ======================= Тренировки =======================
+def training_week(u):
+    start = u.get("workout_start") or ""
+    if not start:
+        start = today()
+        db.set_user(u["user_id"], workout_start=start)
+    days = (datetime.now(TZ).date() - datetime.strptime(start, "%Y-%m-%d").date()).days
+    return max(0, days) // 7 + 1
+
+
+def workout_screen(user_id):
+    u = db.get_user(user_id)
+    week = training_week(u)
+    wd = datetime.now(TZ).weekday()
+    done = db.workout_done(user_id, today())
+    since = (datetime.now(TZ) - timedelta(days=6)).strftime("%Y-%m-%d")
+    cnt = db.workouts_count(user_id, since)
+    text = W.workout_text(wd, week)
+    text += f"\n\n{'✅ Сегодня уже сделано!' if done else '⬜ Сегодня ещё не отмечено'} · за 7 дней: {cnt} трен."
+    hour = u["workout_hour"]
+    text += f"\n⏰ Утреннее напоминание: <b>{'выключено' if hour < 0 else f'в {hour}:00'}</b>"
+    rows = []
+    if not done:
+        rows.append([("✅ Сделал тренировку", "wk_done")])
+    rows.append([("📅 План на неделю", "wk_week")])
+    rows.append([(f"⏰ {h}:00{' ✅' if hour == h else ''}", f"wkh:{h}") for h in (6, 7, 8, 9)])
+    rows.append([(f"⏰ 10:00{' ✅' if hour == 10 else ''}", "wkh:10"), (f"🔕 Выкл{' ✅' if hour < 0 else ''}", "wkh:-1")])
+    return text, ikb(rows)
+
+
+# ======================= Что приготовить =======================
+def recipe_text(n, r):
+    L = [f"🍳 <b>{n + 1}. {r['title']}</b>" + (f" · ~{r['time_min']} мин" if r["time_min"] else "")]
+    L.append("\n<b>На 1 порцию:</b>")
+    for name, g in r["ingredients"]:
+        L.append(f"• {name}" + (f" — {fmt(g)} г" if g else ""))
+    L.append("\n<b>Как готовить:</b>")
+    for i, st in enumerate(r["steps"], 1):
+        L.append(f"{i}. {st}")
+    L.append(f"\n🔥 <b>{fmt(r['kcal'])} ккал</b> · Б {fmt(r['p'])} · Ж {fmt(r['f'])} · У {fmt(r['c'])} г")
+    micro = []
+    for key in ("C", "Fe", "Ca", "K"):
+        pct = r[key] / NORMS[key] * 100
+        if pct >= 15:
+            micro.append(f"{MICRO_NAMES[key][0].lower()} {round(pct)}%")
+    if micro:
+        L.append("💊 Хороший источник: " + ", ".join(micro))
+    return "\n".join(L)
+
+
+def handle_cook_photo(user_id, chat_id):
+    if not ai.enabled():
+        send(chat_id, "ИИ пока не подключён.")
+        return
+    photos, caption = LAST_PHOTO.get(user_id, (None, ""))
+    if not photos:
+        send(chat_id, "Пришли фото продуктов 📷")
+        return
+    r = send(chat_id, "🧑‍🍳 Смотрю, что у тебя есть, и придумываю блюда… (10–20 сек)")
+    wait_id = (r.get("result") or {}).get("message_id")
+
+    def worker():
+        try:
+            products, recipes = ai.recipes_from_photo(download_photo(photos), caption)
+            if not recipes:
+                edit(chat_id, wait_id, "🤷 Не получилось придумать блюда по этому фото. Сфоткай продукты поближе.")
+                return
+            RECIPES[user_id] = recipes
+            head = "🧺 <b>Вижу:</b> " + (", ".join(products) if products else "продукты") + "\n\nВот что можно приготовить 👇"
+            edit(chat_id, wait_id, head)
+            for n, rec in enumerate(recipes):
+                send(chat_id, recipe_text(n, rec), ikb([[("✅ Съел это — записать", f"rcp:{n}")]]))
+        except ai.AIError as e:
+            edit(chat_id, wait_id, "⏳ Лимит бесплатного ИИ исчерпан, попробуй через минуту." if str(e) == "limit"
+                 else "😕 ИИ сейчас не ответил. Попробуй ещё раз.")
+        except Exception:
+            traceback.print_exc()
+            send(chat_id, "😕 Что-то пошло не так. Попробуй ещё раз.")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 # ======================= Фоновые задачи =======================
 def scheduler():
     """Раз в минуту проверяет, кому пора прислать вечерний отчёт."""
@@ -848,6 +988,11 @@ def scheduler():
             now = datetime.now(TZ)
             d = now.strftime("%Y-%m-%d")
             for u in db.all_users():
+                wh = u["workout_hour"]
+                if wh is not None and wh >= 0 and now.hour == wh and u["last_workout"] != d:
+                    db.set_user(u["user_id"], last_workout=d)
+                    t, kb = workout_screen(u["user_id"])
+                    send(u["chat_id"], "☀️ Доброе утро! Вот тренировка на сегодня:\n\n" + t, kb)
                 if u["report_hour"] is None or u["report_hour"] < 0:
                     continue
                 if now.hour == u["report_hour"] and u["last_report"] != d:
@@ -1031,6 +1176,8 @@ def polling():
         {"command": "week", "description": "Статистика за неделю"},
         {"command": "goals", "description": "Цели и время отчёта"},
         {"command": "undo", "description": "Отменить последнюю запись"},
+        {"command": "workout", "description": "Тренировка на сегодня"},
+        {"command": "cook", "description": "Что приготовить из продуктов"},
         {"command": "jarvis", "description": "Связать с голосовым помощником JARVIS"},
     ])
     offset = 0

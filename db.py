@@ -59,6 +59,19 @@ class DB:
         self.conn = None
         for stmt in SCHEMA:
             self.execute(stmt.replace("{serial}", serial))
+        # миграции (новые поля для тренировок)
+        for col, typ in (("workout_hour", "INTEGER DEFAULT 8"), ("last_workout", "TEXT DEFAULT ''"),
+                         ("workout_start", "TEXT DEFAULT ''")):
+            try:
+                if self.pg:
+                    self.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}")
+                else:
+                    cols = [r[1] for r in self.execute("PRAGMA table_info(users)", fetch=True)]
+                    if col not in cols:
+                        self.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+            except Exception as e:
+                print("migration", col, e, flush=True)
+        self.execute("CREATE TABLE IF NOT EXISTS workouts_done (user_id BIGINT NOT NULL, day TEXT NOT NULL)")
 
     def _get_conn(self):
         if self.conn is None:
@@ -98,21 +111,23 @@ class DB:
             self.execute("UPDATE users SET chat_id=? WHERE user_id=?", (chat_id, user_id))
 
     def get_user(self, user_id):
-        rows = self.execute(
-            "SELECT user_id, chat_id, kcal_goal, report_hour, last_report FROM users WHERE user_id=?",
+        rows = self.execute("SELECT user_id, chat_id, kcal_goal, report_hour, last_report, workout_hour, last_workout, workout_start FROM users WHERE user_id=?",
             (user_id,), fetch=True)
-        if not rows:
-            return None
-        r = rows[0]
-        return {"user_id": r[0], "chat_id": r[1], "kcal_goal": r[2], "report_hour": r[3], "last_report": r[4]}
+        return self._u(rows[0]) if rows else None
+
+    @staticmethod
+    def _u(r):
+        return {"user_id": r[0], "chat_id": r[1], "kcal_goal": r[2], "report_hour": r[3], "last_report": r[4],
+                "workout_hour": r[5] if r[5] is not None else 8, "last_workout": r[6] or "",
+                "workout_start": r[7] or ""}
 
     def all_users(self):
-        rows = self.execute("SELECT user_id, chat_id, kcal_goal, report_hour, last_report FROM users", fetch=True)
-        return [{"user_id": r[0], "chat_id": r[1], "kcal_goal": r[2], "report_hour": r[3], "last_report": r[4]} for r in rows]
+        rows = self.execute("SELECT user_id, chat_id, kcal_goal, report_hour, last_report, workout_hour, last_workout, workout_start FROM users", fetch=True)
+        return [self._u(r) for r in rows]
 
     def set_user(self, user_id, **kw):
         for k, v in kw.items():
-            assert k in ("kcal_goal", "report_hour", "last_report")
+            assert k in ("kcal_goal", "report_hour", "last_report", "workout_hour", "last_workout", "workout_start")
             self.execute(f"UPDATE users SET {k}=? WHERE user_id=?", (v, user_id))
 
     # ---------- связь с JARVIS (в базе только хэш кода) ----------
@@ -179,3 +194,15 @@ class DB:
 
     def delete_custom(self, user_id, cid):
         self.execute("DELETE FROM custom_foods WHERE user_id=? AND id=?", (user_id, cid))
+
+    # ---------- тренировки ----------
+    def mark_workout(self, user_id, day):
+        if not self.workout_done(user_id, day):
+            self.execute("INSERT INTO workouts_done (user_id, day) VALUES (?, ?)", (user_id, day))
+
+    def workout_done(self, user_id, day):
+        return bool(self.execute("SELECT 1 FROM workouts_done WHERE user_id=? AND day=?", (user_id, day), fetch=True))
+
+    def workouts_count(self, user_id, since_day):
+        r = self.execute("SELECT COUNT(*) FROM workouts_done WHERE user_id=? AND day>=?", (user_id, since_day), fetch=True)
+        return r[0][0]

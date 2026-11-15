@@ -36,11 +36,11 @@ def enabled():
 def _call(parts):
     last_err = None
     for model in MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         body = {"contents": [{"parts": parts}],
                 "generationConfig": {"temperature": 0.2, "response_mime_type": "application/json"}}
         req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY})
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.loads(r.read().decode("utf-8"))
